@@ -1,0 +1,18 @@
+syntax = "proto3";
+package peer;
+
+message Clock {
+  uint32 sender_id = 1;
+  uint64 timestamp = 2;
+}
+
+message Message {
+  Clock clock = 1;
+  string content = 2;
+}
+
+message Successful {}
+
+service PeerService {
+  rpc SendMessage(Message) returns (Successful);
+}
