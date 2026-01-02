@@ -11,7 +11,6 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::process::exit;
 use std::str::FromStr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
@@ -87,6 +86,7 @@ pub struct PeerState {
     pub time: Arc<RwLock<u64>>,
     pub connections: Arc<RwLock<Connections>>,
     pub history: Arc<RwLock<HashMap<u32, u64>>>,
+    pub blacklist: Arc<RwLock<HashSet<u32>>>,
     pub message_execution_queue: Arc<RwLock<MessageExecutionQueue>>,
     pub words: Arc<RwLock<Vec<String>>>,
     pub push_notifier: Arc<Notify>,
@@ -104,6 +104,7 @@ impl PeerState {
             words: Arc::new(RwLock::new(Self::words_from_file(WORDS_FILE_PATH)?)),
             push_notifier: Arc::new(Notify::new()),
             history: Arc::new(RwLock::new(HashMap::new())),
+            blacklist: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -140,15 +141,13 @@ impl PeerState {
                 }
 
                 loop {
-                    tokio::select! {
-                        Some(msg) = rx.recv() => {
-                             let request = Request::new(msg);
+                    if let Some(msg) = rx.recv().await {
+                        let request = Request::new(msg);
 
-                             if let Err(_) = client.send_message(request).await {
-                                 log::error("Failed to send message to peer.");
-                                 return;
-                             }
-                         }
+                        if let Err(_) = client.send_message(request).await {
+                            log::error("Failed to send message to peer.");
+                            return;
+                        }
                     }
                 }
             });
@@ -335,10 +334,16 @@ impl PeerService for PeerState {
     ) -> Result<Response<RequestStatus>, Status> {
         let push_notifier = self.push_notifier.clone();
         let history = self.history.clone();
+        let blacklist = self.blacklist.clone();
         let intentions = self.intentions.clone();
+        let connections = self.connections.clone();
 
         let received_message = request.into_inner();
         if let Some(clock) = &received_message.clock {
+            if let Some(_) = blacklist.read().await.get(&clock.sender_id) {
+                return Ok(Response::new(RequestStatus { v: 1 }));
+            }
+
             {
                 {
                     if let Some(last_timestamp) = history.read().await.get(&clock.sender_id) {
@@ -347,13 +352,14 @@ impl PeerService for PeerState {
                             && clock.timestamp <= *last_timestamp
                         {
                             log::error(&cformat!(
-                                "Declaring <bold>{}</bold> as malicious peer for reason <bold>(A)</bold> and aborting protocol.",
+                                "Declaring <bold>{}</bold> as malicious peer for reason <bold>(A)</bold> (every message from this peer will be rejected).",
                                 clock.sender_id
                             ));
 
-                            exit(1);
+                            blacklist.write().await.insert(clock.sender_id);
+                            connections.write().await.peers.remove(&clock.sender_id);
 
-                            // return Ok(Response::new(RequestStatus { v: 1 }));
+                            return Ok(Response::new(RequestStatus { v: 1 }));
                         }
 
                         // b
@@ -361,13 +367,14 @@ impl PeerService for PeerState {
                             && clock.timestamp > *self.time.clone().read().await + MAX_DIFF
                         {
                             log::error(&cformat!(
-                                "Declaring <bold>{}</bold> as malicious peer for reason <bold>(B)</bold> and aborting protocol.",
+                                "Declaring <bold>{}</bold> as malicious peer for reason <bold>(B)</bold> (every message from this peer will be rejected).",
                                 clock.sender_id
                             ));
 
-                            exit(1);
+                            blacklist.write().await.insert(clock.sender_id);
+                            connections.write().await.peers.remove(&clock.sender_id);
 
-                            // return Ok(Response::new(RequestStatus { v: 1 }));
+                            return Ok(Response::new(RequestStatus { v: 1 }));
                         }
                     }
 
